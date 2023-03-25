@@ -3,6 +3,12 @@
 package relay
 
 import (
+	"context"
+	"fmt"
+	"github.com/ethereum/go-ethereum/accounts/abi/bind"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/stackup-wallet/stackup-bundler/pkg/modules/guardian"
+	"log"
 	"math/big"
 	"net/http"
 	"time"
@@ -35,13 +41,40 @@ import (
 // This will only work in the case of a private mempool and will not work in the P2P case where ops are
 // propagated through the network and it is impossible to trust a sender's identifier.
 type Relayer struct {
-	db              *badger.DB
-	eoa             *signer.EOA
-	eth             *ethclient.Client
-	chainID         *big.Int
-	beneficiary     common.Address
-	logger          logr.Logger
-	bannedThreshold int
+	db               *badger.DB
+	eoa              *signer.EOA
+	eth              *ethclient.Client
+	chainID          *big.Int
+	beneficiary      common.Address
+	logger           logr.Logger
+	bannedThreshold  int
+	bannedTimeWindow time.Duration
+}
+
+type PrivateRelayer struct {
+	Guardian *guardian.Guardian
+	logger   logr.Logger
+	eth      *ethclient.Client
+}
+
+func NewPrivateRelayer(
+	eoa *signer.EOA,
+	privateContractAddress *common.Address,
+	eth *ethclient.Client, l logr.Logger) *PrivateRelayer {
+	pra, err := guardian.NewPrivateRecoveryAccountTransactor(*privateContractAddress, eth)
+	if err != nil {
+		l.Error(err, "failed to initialize private guardian relayer")
+	}
+
+	return &PrivateRelayer{
+		Guardian: &guardian.Guardian{
+			Eoa:                      eoa,
+			ContractAddress:          privateContractAddress,
+			PrivateAccountTransactor: pra,
+		},
+		eth:    eth,
+		logger: l,
+	}
 }
 
 // New initializes a new EOA relayer for sending batches to the EntryPoint with IP throttling protection.
@@ -54,13 +87,14 @@ func New(
 	l logr.Logger,
 ) *Relayer {
 	return &Relayer{
-		db:              db,
-		eoa:             eoa,
-		eth:             eth,
-		chainID:         chainID,
-		beneficiary:     beneficiary,
-		logger:          l.WithName("relayer"),
-		bannedThreshold: DefaultBanThreshold,
+		db:               db,
+		eoa:              eoa,
+		eth:              eth,
+		chainID:          chainID,
+		beneficiary:      beneficiary,
+		logger:           l.WithName("relayer"),
+		bannedThreshold:  DefaultBanThreshold,
+		bannedTimeWindow: DefaultBanTimeWindow,
 	}
 }
 
@@ -69,6 +103,12 @@ func New(
 // is useful for debugging.
 func (r *Relayer) SetBannedThreshold(limit int) {
 	r.bannedThreshold = limit
+}
+
+// SetBannedTimeWindow sets the limit for how long a banned client will be rejected for. The default value is
+// 24 hours.
+func (r *Relayer) SetBannedTimeWindow(limit time.Duration) {
+	r.bannedTimeWindow = limit
 }
 
 // FilterByClientID is a custom Gin middleware used to prevent requests from banned clients from adding their
@@ -82,6 +122,7 @@ func (r *Relayer) FilterByClientID() gin.HandlerFunc {
 		l := r.logger.WithName("filter_by_client")
 
 		isBanned := false
+		var os, oi int
 		cid := ginutils.GetClientIPFromXFF(c)
 		err := r.db.View(func(txn *badger.Txn) error {
 			opsSeen, opsIncluded, err := getOpsCountByClientID(txn, cid)
@@ -99,6 +140,8 @@ func (r *Relayer) FilterByClientID() gin.HandlerFunc {
 			}
 
 			isBanned = true
+			os = opsSeen
+			oi = opsIncluded
 			return nil
 		})
 		if err != nil {
@@ -110,6 +153,18 @@ func (r *Relayer) FilterByClientID() gin.HandlerFunc {
 		if isBanned {
 			l.Info("client banned")
 			c.Status(http.StatusForbidden)
+			c.JSON(
+				http.StatusForbidden,
+				gin.H{
+					"error": fmt.Sprintf(
+						"opsSeen (%d) exceeds opsIncluded (%d) by allowed threshold (%d). Wait %s to retry.",
+						os,
+						oi,
+						r.bannedThreshold,
+						r.bannedTimeWindow,
+					),
+				},
+			)
 			c.Abort()
 		} else {
 			l.Info("client ok")
@@ -150,7 +205,7 @@ func (r *Relayer) MapUserOpHashToClientID() gin.HandlerFunc {
 				return err
 			}
 
-			return incrementOpsSeenByClientID(txn, cid)
+			return incrementOpsSeenByClientID(txn, cid, r.bannedTimeWindow)
 		})
 		if err != nil {
 			l.Error(err, "map_userop_hash_to_client_id failed")
@@ -158,6 +213,43 @@ func (r *Relayer) MapUserOpHashToClientID() gin.HandlerFunc {
 			return
 		}
 	}
+}
+
+func (r *PrivateRelayer) PrivateRecover(c *gin.Context) {
+	l := r.logger.WithName("private_recover_req")
+
+	var params guardian.RecoverRequest
+
+	if err := c.ShouldBindJSON(&params); err != nil {
+		l.Error(err, "failed to parse recover req params")
+		c.Status(http.StatusBadRequest)
+		return
+	}
+
+	fromAddress := crypto.PubkeyToAddress(*r.Guardian.Eoa.PublicKey)
+	nonce, err := r.eth.PendingNonceAt(context.Background(), fromAddress)
+	if err != nil {
+		log.Fatalf("Failed to retrieve account nonce: %v", err)
+	}
+
+	gasPrice, err := r.eth.SuggestGasPrice(context.Background())
+	if err != nil {
+		log.Fatalf("Failed to suggest gas price: %v", err)
+	}
+
+	auth := bind.NewKeyedTransactor(r.Guardian.Eoa.PrivateKey)
+	auth.Nonce = big.NewInt(int64(nonce))
+	auth.Value = big.NewInt(0)      // in wei
+	auth.GasLimit = uint64(1000000) // in units
+	auth.GasPrice = gasPrice
+
+	tx, err := r.Guardian.PrivateAccountTransactor.Recover(auth, params.NewOwner, params.A, params.B, params.C, params.Input)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, err)
+	} else {
+		c.JSON(http.StatusOK, tx.Hash())
+	}
+	return
 }
 
 // SendUserOperation returns a BatchHandler that is used by the Bundler to send batches in a regular EOA
@@ -180,6 +272,7 @@ func (r *Relayer) SendUserOperation() modules.BatchHandlerFunc {
 
 			// Estimate gas for handleOps() and drop all userOps that cause unexpected reverts.
 			var gas uint64
+			estRev := []string{}
 			for len(ctx.Batch) > 0 {
 				est, revert, err := transaction.EstimateHandleOpsGas(
 					r.eoa,
@@ -194,6 +287,7 @@ func (r *Relayer) SendUserOperation() modules.BatchHandlerFunc {
 					return err
 				} else if revert != nil {
 					ctx.MarkOpIndexForRemoval(revert.OpIndex)
+					estRev = append(estRev, revert.Reason)
 
 					hashes := getUserOpHashesFromOps(ctx.EntryPoint, ctx.ChainID, ctx.PendingRemoval...)
 					if err := removeUserOpHashEntries(txn, hashes...); err != nil {
@@ -204,8 +298,10 @@ func (r *Relayer) SendUserOperation() modules.BatchHandlerFunc {
 					break
 				}
 			}
+			ctx.Data["relayer_est_revert_reasons"] = estRev
 
 			// Call handleOps() with gas estimate and drop all userOps that cause unexpected reverts.
+			txnRev := []string{}
 			for len(ctx.Batch) > 0 {
 				t, revert, err := transaction.HandleOps(
 					r.eoa,
@@ -221,6 +317,7 @@ func (r *Relayer) SendUserOperation() modules.BatchHandlerFunc {
 					return err
 				} else if revert != nil {
 					ctx.MarkOpIndexForRemoval(revert.OpIndex)
+					txnRev = append(txnRev, revert.Reason)
 
 					hashes := getUserOpHashesFromOps(ctx.EntryPoint, ctx.ChainID, ctx.PendingRemoval...)
 					if err := removeUserOpHashEntries(txn, hashes...); err != nil {
@@ -231,10 +328,11 @@ func (r *Relayer) SendUserOperation() modules.BatchHandlerFunc {
 					break
 				}
 			}
+			ctx.Data["relayer_txn_revert_reasons"] = txnRev
 
 			hashes := getUserOpHashesFromOps(ctx.EntryPoint, ctx.ChainID, ctx.Batch...)
 			del = append([]string{}, hashes...)
-			return incrementOpsIncludedByUserOpHashes(txn, hashes...)
+			return incrementOpsIncludedByUserOpHashes(txn, r.bannedTimeWindow, hashes...)
 		})
 		if err != nil {
 			return err

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/gin-gonic/gin"
@@ -23,6 +24,10 @@ type Values struct {
 	MaxOpsForUnstakedSender int
 	Beneficiary             string
 
+	// Private mode variables.
+	RelayerBannedThreshold  int
+	RelayerBannedTimeWindow time.Duration
+
 	// Searcher mode variables.
 	EthBuilderUrl     string
 	BlocksInTheFuture int
@@ -31,6 +36,8 @@ type Values struct {
 	DebugMode              bool
 	GinMode                string
 	BundlerCollectorTracer string
+
+	PrivateGuardianContractAddress string
 }
 
 func envArrayToAddressSlice(s string) []common.Address {
@@ -82,10 +89,13 @@ func GetValues() *Values {
 	_ = viper.BindEnv("erc4337_bundler_beneficiary")
 	_ = viper.BindEnv("erc4337_bundler_max_verification_gas")
 	_ = viper.BindEnv("erc4337_bundler_max_ops_for_unstaked_sender")
+	_ = viper.BindEnv("erc4337_bundler_relayer_banned_threshold")
+	_ = viper.BindEnv("erc4337_bundler_relayer_banned_time_window")
 	_ = viper.BindEnv("erc4337_bundler_eth_builder_url")
 	_ = viper.BindEnv("erc4337_bundler_blocks_in_the_future")
 	_ = viper.BindEnv("erc4337_bundler_debug_mode")
 	_ = viper.BindEnv("erc4337_bundler_gin_mode")
+	_ = viper.BindEnv("private_guardian_address")
 
 	// Validate required variables
 	if variableNotSetOrIsNil("erc4337_bundler_eth_client_url") {
@@ -126,6 +136,8 @@ func GetValues() *Values {
 	beneficiary := viper.GetString("erc4337_bundler_beneficiary")
 	maxVerificationGas := big.NewInt(int64(viper.GetInt("erc4337_bundler_max_verification_gas")))
 	maxOpsForUnstakedSender := viper.GetInt("erc4337_bundler_max_ops_for_unstaked_sender")
+	relayerBannedThreshold := viper.GetInt("erc4337_bundler_relayer_banned_threshold")
+	relayerBannedTimeWindow := viper.GetInt("erc4337_bundler_relayer_banned_time_window") * int(time.Second)
 	ethBuilderUrl := viper.GetString("erc4337_bundler_eth_builder_url")
 	blocksInTheFuture := viper.GetInt("erc4337_bundler_blocks_in_the_future")
 	debugMode := viper.GetBool("erc4337_bundler_debug_mode")
@@ -139,6 +151,8 @@ func GetValues() *Values {
 		Beneficiary:             beneficiary,
 		MaxVerificationGas:      maxVerificationGas,
 		MaxOpsForUnstakedSender: maxOpsForUnstakedSender,
+		RelayerBannedThreshold:  relayerBannedThreshold,
+		RelayerBannedTimeWindow: time.Duration(relayerBannedTimeWindow),
 		EthBuilderUrl:           ethBuilderUrl,
 		BlocksInTheFuture:       blocksInTheFuture,
 		DebugMode:               debugMode,
